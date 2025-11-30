@@ -43,6 +43,21 @@ $tariff_percent = [
     '8471.41.00' => 0.15,
 ];
 
+// Assessed customs value per kg (in MWK) used to derive Declared Value from HS + Weight
+$assessed_value_mwk_per_kg = [
+    '8528.72.00' => 40000,
+    '8708.99.00' => 25000,
+    '5208.52.00' => 15000,
+    '6104.43.00' => 18000,
+    '8432.80.00' => 20000,
+    '8517.13.00' => 35000,
+    '9503.00.00' => 12000,
+    '8471.30.00' => 30000,
+    '8471.41.00' => 32000,
+    '8525.50.00' => 28000,
+];
+$assessed_default_mwk_per_kg = 20000; // fallback per-kg valuation in MWK
+
 // Calculator currencies (for embedded tax calculator UI)
 $calc_currencies = [
     'USD' => 'US Dollar',
@@ -162,19 +177,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         // Normalize numeric inputs
         $currency = substr($input['currency'] ?? $default_currency, 0, 3);
-        $currency_amount = (float)($input['currency_amount'] ?? 0);
         $exchange_rate_live = rate_to_mwk($currency);
         $exchange_rate = ($exchange_rate_live && $exchange_rate_live > 0) ? (float)$exchange_rate_live : (float)($input['exchange_rate'] ?? $default_fx);
+
+        // Get commodity code and gross weight to derive value
+        $commodity_code = $input['commodity_code'] ?? null;
+        $gross_weight = isset($input['gross_weight']) ? (float)$input['gross_weight'] : 0;
+
+        // Derive declared value from HS and weight (logic from agent_tax_calculation.php)
+        $assessed_per_kg_mwk = $assessed_value_mwk_per_kg[$commodity_code] ?? $assessed_default_mwk_per_kg;
+        $declared_value_mwk = max(0, $gross_weight) * $assessed_per_kg_mwk;
+        $currency_amount = $declared_value_mwk / max(0.000001, $exchange_rate);
 
         // Auto-calc base by default; allow manual override if provided and > 0
         $tax_base_mwk = (isset($input['tax_base_mwk']) && (float)$input['tax_base_mwk'] > 0)
             ? (float)$input['tax_base_mwk']
-            : ($currency_amount * $exchange_rate);
+            : $declared_value_mwk;
 
         $vat_rate = isset($input['vat_rate']) ? (float)$input['vat_rate'] : (float)$default_vat;
 
         // Ad valorem import duty + VAT on (declared + duty)
-        $declared_mwk = (float)$currency_amount * (float)$exchange_rate;
+        $declared_mwk = $declared_value_mwk;
         $ad_valorem_rate = 0.0;
         if (!empty($commodity_code) && isset($tariff_percent[$commodity_code])) {
             $ad_valorem_rate = (float)$tariff_percent[$commodity_code];
@@ -183,10 +206,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $vat_amount_mwk = ($vat_rate !== null) ? (($declared_mwk + $duty_mwk) * ((float)$vat_rate / 100.0)) : 0.0;
         $total_tax_mwk = $duty_mwk + $vat_amount_mwk;
         $total_declaration_mwk = $declared_mwk + $total_tax_mwk;
+
+        // Additional tax rates and amounts (currently not used but fields exist)
+        $ait_rate = null;
         $ait_amount_mwk = 0;
+        $icd_rate = null;
         $icd_amount_mwk = 0;
+        $exc_rate = null;
         $exc_amount_mwk = 0;
+        $lev_rate = null;
         $lev_amount_mwk = 0;
+
         $total_fees_mwk = $total_tax_mwk;
         // Tax base equals declared value in MWK
         $tax_base_mwk = $declared_mwk;
@@ -231,9 +261,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $packages_description = $input['packages_description'] ?? null;
         $package_type = $input['package_type'] ?? null;
         $num_packages = isset($input['num_packages']) ? (int)$input['num_packages'] : null;
-        $gross_weight = isset($input['gross_weight']) ? (float)$input['gross_weight'] : null;
         $net_weight = isset($input['net_weight']) ? (float)$input['net_weight'] : null;
-        $commodity_code = $input['commodity_code'] ?? null;
+        // $commodity_code already defined above for tax calculations
         $invoice_value = isset($input['invoice_value']) ? (float)$input['invoice_value'] : null;
         $units = isset($input['units']) ? (int)$input['units'] : null;
         $statistical_value_mwk = isset($input['statistical_value_mwk']) ? (float)$input['statistical_value_mwk'] : null;
@@ -528,6 +557,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <link href="assets/css/style.css" rel="stylesheet">
+    <style>
+        #calculateTaxBtn {
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        #calculateTaxBtn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15);
+        }
+        #calculateTaxBtn:disabled {
+            cursor: not-allowed;
+            opacity: 0.6;
+        }
+        #taxResultsCard {
+            animation: slideDown 0.4s ease-out;
+        }
+        @keyframes slideDown {
+            from {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+    </style>
 </head>
 
 <body>
@@ -659,9 +715,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 </div>
 
                                 <input type="hidden" name="commodity_code" id="commodity_code_hidden" value="<?php echo htmlspecialchars($declaration['commodity_code'] ?? ($suggested_code ?? '')); ?>">
+                                
                                 <div class="col-12">
                                     <label class="form-label">Goods Description</label>
                                     <textarea class="form-control" name="goods_description" rows="2"><?php echo htmlspecialchars($declaration['goods_description'] ?? ($shipment['goods_description'] ?? '')); ?></textarea>
+                                </div>
+
+                                <!-- Calculate Button -->
+                                <div class="col-12 mt-3">
+                                    <button type="button" id="calculateTaxBtn" class="btn btn-success btn-lg w-100" disabled>
+                                        <i class="fas fa-calculator me-2"></i>Calculate Taxes
+                                    </button>
+                                    <small class="text-muted d-block mt-2 text-center" id="calculateHint">
+                                        Please select HS Code, Currency, and enter Weight to calculate taxes
+                                    </small>
                                 </div>
                             </div>
                         </div>
@@ -689,9 +756,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             </div>
         </form>
 
-        <div class="mt-4">
-            <div class="card">
-                <div class="card-header"><strong>Tax Calculation Results</strong></div>
+        <div class="mt-4" id="taxResultsCard" style="display: none;">
+            <div class="card border-success">
+                <div class="card-header bg-success text-white">
+                    <strong><i class="fas fa-check-circle me-2"></i>Tax Calculation Results</strong>
+                </div>
                 <div class="card-body">
                     <div class="row g-3">
                         <div class="col-md-6">
@@ -764,6 +833,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             const defaultCurrency = <?php echo json_encode($default_currency ?? 'USD'); ?>;
             const tariffPercent = <?php echo json_encode($tariff_percent ?? []); ?>; // ad valorem duty fraction per HS
             const fallbackRates = <?php echo json_encode(EXCHANGE_RATES ?? []); ?>; // per-currency fallback MWK rates
+            const assessedValuePerKg = <?php echo json_encode($assessed_value_mwk_per_kg ?? []); ?>;
+            const assessedDefaultPerKg = <?php echo json_encode($assessed_default_mwk_per_kg ?? 20000); ?>;
             const defaultSpecificDuty = 500.0; // MWK per kg fallback when HS has no explicit rate
             const VAT_FRAC = <?php echo json_encode(((float)VAT_RATE) / 100.0); ?>;
 
@@ -836,21 +907,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 const curSelect = document.getElementById('currencySelect');
                 const cur = (curSelect && curSelect.value) ? curSelect.value : ((fCur && fCur.value) ? fCur.value : defaultCurrency);
                 if (fCur) fCur.value = cur;
-                // Declared value from hidden source (in selected currency)
-                const inv = document.getElementById('invoice_value_source');
-                const amount = inv ? parseFloat(inv.value || '0') : 0;
-                if (fAmt) fAmt.value = (isFinite(amount) ? amount.toFixed(2) : '0.00');
+
                 // FX: use current field value if already set by currency change; otherwise fetch
                 let rate = (fRate && isFinite(parseFloat(fRate.value))) ? parseFloat(fRate.value) : NaN;
                 if (!isFinite(rate) || rate <= 0) {
                     rate = await fetchRate(cur);
                     if (fRate) fRate.value = rate.toFixed(6);
                 }
-                const declaredMWK = (isFinite(amount) ? amount : 0) * rate;
+
+                // Derive declared value from HS and weight
+                const grossWeight = fGW ? parseFloat(fGW.value || '0') : 0;
+                const assessedPerKg = (code && Object.prototype.hasOwnProperty.call(assessedValuePerKg, code)) ? parseFloat(assessedValuePerKg[code]) : assessedDefaultPerKg;
+                const declaredMWK = grossWeight * assessedPerKg;
+                const amount = declaredMWK / rate; // This is currency amount
+
+                if (fAmt) fAmt.value = (isFinite(amount) ? amount.toFixed(2) : '0.00');
                 if (fBase) fBase.value = declaredMWK.toFixed(2);
+                
                 // Ad valorem duty and VAT (match server)
                 const adRate = (code && Object.prototype.hasOwnProperty.call(tariffPercent, code)) ? parseFloat(tariffPercent[code]) : 0;
-                const dutyCur = (isFinite(adRate) ? adRate : 0) * (isFinite(amount) ? amount : 0);
+                const dutyCur = (isFinite(amount) ? amount : 0) * adRate;
                 const dutyMWK = dutyCur * rate;
                 const vatBaseCur = (isFinite(amount) ? amount : 0) + dutyCur;
                 const vatBaseMWK = vatBaseCur * rate;
@@ -918,27 +994,47 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (exchEl) exchEl.textContent = `Exchange Rate: 1 ${codeLabel} = ${rate.toFixed(2)} MWK`;
             }
 
-            // React to HS change and weight/tax inputs
-            const hsCalcLive = document.getElementById('calculator_hs');
-            if (hsCalcLive) {
-                hsCalcLive.addEventListener('change', computeAuto);
-            }
-            const gwField = document.getElementById('gross_weight_field');
-            if (gwField) {
-                gwField.addEventListener('input', computeAuto);
-                gwField.addEventListener('change', computeAuto);
-            }
-            ['ait_rate', 'icd_rate', 'exc_rate', 'lev_rate'].forEach(n => {
-                const el = document.querySelector(`input[name="${n}"]`);
-                if (el) {
-                    el.addEventListener('input', computeAuto);
-                    el.addEventListener('change', computeAuto);
+            // Function to check if all required fields are filled
+            function checkCalculateButton() {
+                const hsCalc = document.getElementById('calculator_hs');
+                const curSelect = document.getElementById('currencySelect');
+                const grossWeight = document.getElementById('gross_weight_field');
+                const calculateBtn = document.getElementById('calculateTaxBtn');
+                const hint = document.getElementById('calculateHint');
+
+                const hasHS = hsCalc && hsCalc.value;
+                const hasCurrency = curSelect && curSelect.value;
+                const hasWeight = grossWeight && parseFloat(grossWeight.value) > 0;
+
+                if (hasHS && hasCurrency && hasWeight) {
+                    if (calculateBtn) {
+                        calculateBtn.disabled = false;
+                        calculateBtn.classList.remove('btn-secondary');
+                        calculateBtn.classList.add('btn-success');
+                    }
+                    if (hint) hint.textContent = 'Click "Calculate Taxes" to see the breakdown';
+                } else {
+                    if (calculateBtn) {
+                        calculateBtn.disabled = true;
+                        calculateBtn.classList.remove('btn-success');
+                        calculateBtn.classList.add('btn-secondary');
+                    }
+                    if (hint) hint.textContent = 'Please select HS Code, Currency, and enter Weight to calculate taxes';
                 }
-            });
-            hsCalcLive && hsCalcLive.addEventListener('change', computeAuto);
-            const grossW = document.getElementById('gross_weight_field');
-            grossW && grossW.addEventListener('input', computeAuto);
+            }
+
+            // Add event listeners to check button state
+            const hsCalcLive = document.getElementById('calculator_hs');
+            const gwField = document.getElementById('gross_weight_field');
             const currencySelect = document.getElementById('currencySelect');
+
+            if (hsCalcLive) {
+                hsCalcLive.addEventListener('change', checkCalculateButton);
+            }
+            if (gwField) {
+                gwField.addEventListener('input', checkCalculateButton);
+                gwField.addEventListener('change', checkCalculateButton);
+            }
             if (currencySelect) {
                 // Initialize select from hidden if select is empty, then set currency & rate
                 const hiddenCurEl = document.getElementById('currency_hidden');
@@ -949,10 +1045,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 setCurrencyAndRate(currencySelect.value || (hiddenCurEl ? hiddenCurEl.value : defaultCurrency));
                 currencySelect.addEventListener('change', () => {
                     setCurrencyAndRate(currencySelect.value);
+                    checkCalculateButton();
                 });
             }
-            // Initialize once using hidden source
-            computeAuto();
+
+            // Calculate Tax Button Click Handler
+            const calculateBtn = document.getElementById('calculateTaxBtn');
+            if (calculateBtn) {
+                calculateBtn.addEventListener('click', async function() {
+                    // Change button state
+                    this.disabled = true;
+                    this.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Calculating...';
+
+                    // Run calculation
+                    await computeAuto();
+
+                    // Show results card with animation
+                    const resultsCard = document.getElementById('taxResultsCard');
+                    if (resultsCard) {
+                        resultsCard.style.display = 'block';
+                        resultsCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                    }
+
+                    // Reset button
+                    this.disabled = false;
+                    this.innerHTML = '<i class="fas fa-check-circle me-2"></i>Recalculate Taxes';
+                    this.classList.remove('btn-success');
+                    this.classList.add('btn-primary');
+                });
+            }
+
+            // Check button state on page load
+            checkCalculateButton();
         })();
     </script>
 </body>
