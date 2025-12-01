@@ -521,11 +521,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     // Optional email notification to client
                     $clientEmail = $cinfo['client_email'] ?? '';
                     if (!empty($clientEmail) && filter_var($clientEmail, FILTER_VALIDATE_EMAIL)) {
-                        $headers = [];
-                        $headers[] = 'From: ' . (defined('SMTP_FROM_NAME') ? SMTP_FROM_NAME : APP_NAME) . ' <' . (defined('SMTP_FROM') ? SMTP_FROM : 'noreply@localhost') . '>';
-                        $headers[] = 'MIME-Version: 1.0';
-                        $headers[] = 'Content-Type: text/plain; charset=UTF-8';
-                        @mail($clientEmail, $subject, $content, implode("\r\n", $headers));
+                        sendEmail($clientEmail, $subject, $content);
                     }
                 } catch (Exception $em) { /* non-blocking */
                 }

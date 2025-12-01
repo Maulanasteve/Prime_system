@@ -1,6 +1,7 @@
 <?php
 require_once 'config.php';
 require_once 'database.php';
+require_once 'vendor/autoload.php';
 
 // Check if user is logged in and is a client
 if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'client') {
@@ -27,10 +28,11 @@ try {
     $database = new Database();
     $db = $database->getConnection();
 
-    // Verify shipment belongs to this client
-    $query = "SELECT s.*, c.company_name
+    // Verify shipment belongs to this client and get client email
+    $query = "SELECT s.*, c.company_name, u.email as client_email
               FROM shipments s
               JOIN clients c ON s.client_id = c.client_id
+              JOIN users u ON c.user_id = u.user_id
               WHERE s.shipment_id = :shipment_id AND c.user_id = :user_id";
     $stmt = $db->prepare($query);
     $stmt->bindParam(':shipment_id', $shipment_id);
@@ -44,15 +46,15 @@ try {
     }
 
     $shipment = $stmt->fetch(PDO::FETCH_ASSOC);
+    $client_email = $shipment['client_email'];
 
-    // Create Stripe checkout session using Stripe API
-    $stripe_secret = STRIPE_SECRET_KEY;
+    // Create Stripe checkout session
+    \Stripe\Stripe::setApiKey(STRIPE_SECRET_KEY);
 
     $success_url = APP_URL . '/payment_success.php?session_id={CHECKOUT_SESSION_ID}&shipment_id=' . $shipment_id;
     $cancel_url = APP_URL . '/payment_cancel.php?shipment_id=' . $shipment_id;
 
-    // Prepare Stripe API request
-    $session_data = [
+    $session = \Stripe\Checkout\Session::create([
         'payment_method_types' => ['card'],
         'line_items' => [[
             'price_data' => [
@@ -68,53 +70,13 @@ try {
         'mode' => 'payment',
         'success_url' => $success_url,
         'cancel_url' => $cancel_url,
+        'customer_email' => $client_email,
         'metadata' => [
             'shipment_id' => $shipment_id,
             'tracking_number' => $shipment['tracking_number'],
             'client_id' => $_SESSION['user_id']
         ]
-    ];
-
-    // Make API call to Stripe
-    $ch = curl_init('https://api.stripe.com/v1/checkout/sessions');
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, [
-        'Authorization: Bearer ' . $stripe_secret,
-        'Content-Type: application/x-www-form-urlencoded'
     ]);
-
-    // Build form-encoded data
-    $post_data = http_build_query([
-        'payment_method_types[]' => 'card',
-        'line_items[0][price_data][currency]' => $currency,
-        'line_items[0][price_data][product_data][name]' => 'Customs Clearance - ' . $shipment['tracking_number'],
-        'line_items[0][price_data][product_data][description]' => 'Goods: ' . substr($shipment['goods_description'], 0, 100),
-        'line_items[0][price_data][unit_amount]' => $amount,
-        'line_items[0][quantity]' => 1,
-        'mode' => 'payment',
-        'success_url' => $success_url,
-        'cancel_url' => $cancel_url,
-        'metadata[shipment_id]' => $shipment_id,
-        'metadata[tracking_number]' => $shipment['tracking_number'],
-        'metadata[client_id]' => $_SESSION['user_id']
-    ]);
-
-    curl_setopt($ch, CURLOPT_POSTFIELDS, $post_data);
-    $response = curl_exec($ch);
-    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-
-    if ($http_code !== 200) {
-        $error_response = json_decode($response, true);
-        header('Content-Type: application/json');
-        echo json_encode([
-            'error' => $error_response['error']['message'] ?? 'Failed to create checkout session'
-        ]);
-        exit();
-    }
-
-    $session = json_decode($response, true);
 
     // Log activity
     logActivity($_SESSION['user_id'], 'stripe_session_created', 'payments', $shipment_id,
@@ -122,9 +84,12 @@ try {
 
     header('Content-Type: application/json');
     echo json_encode([
-        'id' => $session['id']
+        'id' => $session->id
     ]);
 
+} catch (\Stripe\Exception\ApiErrorException $e) {
+    header('Content-Type: application/json');
+    echo json_encode(['error' => $e->getMessage()]);
 } catch (Exception $e) {
     header('Content-Type: application/json');
     echo json_encode(['error' => $e->getMessage()]);

@@ -1,6 +1,7 @@
 <?php
 require_once 'config.php';
 require_once 'database.php';
+require_once 'vendor/autoload.php';
 
 // Check if user is logged in and is a client
 if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'client') {
@@ -21,66 +22,83 @@ $db = $database->getConnection();
 
 try {
     // Verify the Stripe session
-    $ch = curl_init('https://api.stripe.com/v1/checkout/sessions/' . $session_id);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, [
-        'Authorization: Bearer ' . STRIPE_SECRET_KEY
-    ]);
-    $response = curl_exec($ch);
-    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
+    \Stripe\Stripe::setApiKey(STRIPE_SECRET_KEY);
+    $session = \Stripe\Checkout\Session::retrieve($session_id);
 
-    if ($http_code === 200) {
-        $session = json_decode($response, true);
+    if ($session->payment_status === 'paid') {
+        $db->beginTransaction();
 
-        if ($session['payment_status'] === 'paid') {
-            $db->beginTransaction();
+        // Update payment status
+        $update_payment = $db->prepare("UPDATE payments SET
+            status = 'completed',
+            payment_method = 'stripe',
+            transaction_id = :transaction_id,
+            payment_date = NOW(),
+            updated_at = NOW()
+            WHERE shipment_id = :shipment_id AND status = 'pending'");
+        $update_payment->bindValue(':transaction_id', $session->payment_intent);
+        $update_payment->bindValue(':shipment_id', $shipment_id, PDO::PARAM_INT);
+        $update_payment->execute();
 
-            // Update payment status
-            $update_payment = $db->prepare("UPDATE payments SET
-                status = 'completed',
-                payment_method = 'stripe',
-                transaction_id = :transaction_id,
-                payment_date = NOW(),
-                updated_at = NOW()
-                WHERE shipment_id = :shipment_id AND status = 'pending'");
-            $update_payment->bindValue(':transaction_id', $session['payment_intent']);
-            $update_payment->bindValue(':shipment_id', $shipment_id, PDO::PARAM_INT);
-            $update_payment->execute();
+        // Update shipment payment status
+        $update_shipment = $db->prepare("UPDATE shipments SET
+            payment_status = 'completed',
+            updated_at = NOW()
+            WHERE shipment_id = :shipment_id");
+        $update_shipment->bindValue(':shipment_id', $shipment_id, PDO::PARAM_INT);
+        $update_shipment->execute();
 
-            // Update shipment payment status
-            $update_shipment = $db->prepare("UPDATE shipments SET
-                payment_status = 'completed',
-                updated_at = NOW()
-                WHERE shipment_id = :shipment_id");
-            $update_shipment->bindValue(':shipment_id', $shipment_id, PDO::PARAM_INT);
-            $update_shipment->execute();
+        // Get shipment and client details for notification
+        $shipment_query = $db->prepare("SELECT s.*, c.company_name, u.email as client_email
+            FROM shipments s
+            JOIN clients c ON s.client_id = c.client_id
+            JOIN users u ON c.user_id = u.user_id
+            WHERE s.shipment_id = :shipment_id");
+        $shipment_query->bindValue(':shipment_id', $shipment_id, PDO::PARAM_INT);
+        $shipment_query->execute();
+        $shipment = $shipment_query->fetch(PDO::FETCH_ASSOC);
 
-            // Get shipment details for notification
-            $shipment_query = $db->prepare("SELECT s.*, c.company_name
-                FROM shipments s
-                JOIN clients c ON s.client_id = c.client_id
-                WHERE s.shipment_id = :shipment_id");
-            $shipment_query->bindValue(':shipment_id', $shipment_id, PDO::PARAM_INT);
-            $shipment_query->execute();
-            $shipment = $shipment_query->fetch(PDO::FETCH_ASSOC);
+        // Log activity
+        logActivity($_SESSION['user_id'], 'payment_completed', 'payments', $shipment_id,
+            'Payment completed via Stripe for shipment ' . ($shipment['tracking_number'] ?? $shipment_id));
 
-            // Log activity
-            logActivity($_SESSION['user_id'], 'payment_completed', 'payments', $shipment_id,
-                'Payment completed via Stripe for shipment ' . ($shipment['tracking_number'] ?? $shipment_id));
+        // Notify admin
+        notifyAdmin(
+            'Payment Received - ' . ($shipment['tracking_number'] ?? $shipment_id),
+            'Payment has been successfully received via Stripe for shipment ' . ($shipment['tracking_number'] ?? $shipment_id) . ' (' . ($shipment['company_name'] ?? 'Unknown') . ')',
+            'success',
+            'payments',
+            $shipment_id
+        );
 
-            // Notify admin
-            notifyAdmin(
-                'Payment Received - ' . ($shipment['tracking_number'] ?? $shipment_id),
-                'Payment has been successfully received via Stripe for shipment ' . ($shipment['tracking_number'] ?? $shipment_id) . ' (' . ($shipment['company_name'] ?? 'Unknown') . ')',
-                'success',
-                'payments',
-                $shipment_id
-            );
+        // Send receipt email to client
+        $client_email_subject = 'Payment Receipt for Shipment #' . ($shipment['tracking_number'] ?? $shipment_id);
+        $client_email_body = '
+            <h1>Thank you for your payment!</h1>
+            <p>Your payment for shipment <strong>' . ($shipment['tracking_number'] ?? $shipment_id) . '</strong> has been successfully processed.</p>
+            <p><strong>Amount Paid:</strong> ' . formatCurrency($session->amount_total / 100, $session->currency) . '</p>
+            <p><strong>Transaction ID:</strong> ' . $session->payment_intent . '</p>
+            <p>You can track your shipment here: <a href="' . APP_URL . '/track_shipment.php?tracking_number=' . ($shipment['tracking_number'] ?? '') . '">' . APP_URL . '/track_shipment.php</a></p>
+        ';
+        sendEmail($shipment['client_email'], $client_email_subject, $client_email_body);
 
-            $db->commit();
-            $success = true;
+        // Send notification email to admin
+        $admin_email_subject = 'Payment Received for Shipment #' . ($shipment['tracking_number'] ?? $shipment_id);
+        $admin_email_body = '
+            <h1>Payment Received</h1>
+            <p>A payment has been successfully received for shipment <strong>' . ($shipment['tracking_number'] ?? $shipment_id) . '</strong>.</p>
+            <p><strong>Client:</strong> ' . ($shipment['company_name'] ?? 'Unknown') . '</p>
+            <p><strong>Amount Paid:</strong> ' . formatCurrency($session->amount_total / 100, $session->currency) . '</p>
+            <p><strong>Transaction ID:</strong> ' . $session->payment_intent . '</p>
+            <p>Please review the shipment and update its status accordingly.</p>
+        ';
+        $admin_users_query = $db->query("SELECT email FROM users WHERE role = 'admin' AND status = 'active'");
+        while($admin = $admin_users_query->fetch(PDO::FETCH_ASSOC)) {
+            sendEmail($admin['email'], $admin_email_subject, $admin_email_body);
         }
+
+        $db->commit();
+        $success = true;
     }
 } catch (Exception $e) {
     if ($db->inTransaction()) {
@@ -123,7 +141,7 @@ try {
                             <h2 class="text-success mb-3">Payment Successful!</h2>
                             <p class="text-muted mb-4">
                                 Your payment has been processed successfully.<br>
-                                Thank you for your payment.
+                                A receipt has been sent to your email address.
                             </p>
                             <div class="alert alert-info">
                                 <strong>Next Steps:</strong><br>
