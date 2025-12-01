@@ -48,12 +48,17 @@ define('EXCHANGE_RATES', [
     'UGX' => 0.45     // 1 UGX = 0.45 MWK
 ]);
 
+// Stripe Payment Configuration
+define('STRIPE_PUBLISHABLE_KEY', 'pk_test_51SXsNjFdEiHBG304ReP8ZzesVglSQzHa5dgJl8PV4czvyWuJN0uk7FbesKO316MUULxVKwaKkcyI9N6iPNMlruNW00zF1TYsD8');
+define('STRIPE_SECRET_KEY', 'sk_test_51SXsNjFdEiHBG304wPKFt2nVHMFhlOMA0uawL0vxOZ1BJusQJVaVUYjiG6nETJN0FS0FUIKUR1e76jVy0brSGQtm00Cen2qhgy');
+define('STRIPE_CURRENCY', 'usd'); // Stripe charges in USD
+
 // Email Configuration
-define('SMTP_HOST', 'localhost');
+define('SMTP_HOST', 'smtp.gmail.com');
 define('SMTP_PORT', 587);
-define('SMTP_USER', 'noreply@primecargo.mw');
-define('SMTP_PASS', '');
-define('SMTP_FROM', 'noreply@primecargo.mw');
+define('SMTP_USER', 'maulanasteve3@gmail.com');
+define('SMTP_PASS', 'qktc osfh ouhr ohws');
+define('SMTP_FROM', 'maulanasteve3@gmail.com');
 define('SMTP_FROM_NAME', 'Prime Cargo Limited');
 
 // Pagination
@@ -245,3 +250,5 @@ function notifyAdmin($title, $message, $type = 'info', $relatedTable = null, $re
     }
     return false;
 }
+
+require_once __DIR__ . '/includes/email_functions.php';
